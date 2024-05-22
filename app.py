@@ -1,0 +1,116 @@
+import cv2
+import time
+import os
+import traceback
+from google.cloud import storage
+from google.auth.transport.requests import Request
+from google.oauth2 import service_account
+from linebot import LineBotApi
+from linebot.models import TextSendMessage, ImageSendMessage
+from datetime import timedelta
+
+# LINE setup
+LINE_ACCESS_TOKEN = os.getenv('LINE_ACCESS_TOKEN')
+LINE_USER_ID = os.getenv('LINE_USER_ID')  # The user ID to send messages to
+
+if LINE_ACCESS_TOKEN is None or LINE_USER_ID is None:
+    raise ValueError("LINE_ACCESS_TOKEN or LINE_USER_ID environment variable not set")
+
+line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
+
+# Google Cloud Storage setup
+GOOGLE_APPLICATION_CREDENTIAL = os.getenv('GOOGLE_APPLICATION_CREDENTIAL')
+if GOOGLE_APPLICATION_CREDENTIAL is None:
+    raise ValueError("GOOGLE_APPLICATION_CREDENTIALS environment variable not set")
+
+credentials = service_account.Credentials.from_service_account_file(GOOGLE_APPLICATION_CREDENTIAL)
+
+def upload_to_bucket(bucket_name, source_file_name, destination_blob_name):
+    """Uploads a file to the bucket and returns the signed URL."""
+    storage_client = storage.Client(credentials=credentials)
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_filename(source_file_name)
+
+    # Generate signed URL valid for 1 hour
+    url = blob.generate_signed_url(expiration=timedelta(hours=1), method='GET')
+    return url
+
+def send_line_message(image_path):
+    try:
+        # Send the text message
+        text_message = TextSendMessage(text="Detection has stayed over the threshold for more than 10 seconds. See the attached image.")
+        line_bot_api.push_message(LINE_USER_ID, text_message)
+        print("Text message sent successfully!")
+        
+        # Upload the image to Google Cloud Storage and get the signed URL
+        bucket_name = 'iot_pro'
+        destination_blob_name = os.path.basename(image_path)
+        image_url = upload_to_bucket(bucket_name, image_path, destination_blob_name)
+        
+        # Send the image message
+        image_message = ImageSendMessage(
+            original_content_url=image_url,
+            preview_image_url=image_url  # Usually, you might want a smaller preview image
+        )
+        line_bot_api.push_message(LINE_USER_ID, image_message)
+        print("Image message sent successfully!")
+    
+    except Exception as e:
+        print(f"Failed to send LINE message: {e}")
+        traceback.print_exc()
+
+# Load classifiers
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+if face_cascade.empty():
+    raise ValueError("Failed to load cascade classifiers.")
+
+# Initialize video capture
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    raise IOError("Cannot open webcam")
+
+start_time = None
+detection_active = False
+cooldown_time = 60
+last_email_time = 0
+threshold = 3
+image_path = "last_detection.jpg"
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
+
+        current_max = 0
+        for (x, y, w, h) in faces:
+            detection_rate = w * h / (frame.shape[0] * frame.shape[1]) * 100
+            if detection_rate > current_max:
+                current_max = detection_rate
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
+            cv2.putText(frame, f'Face: {detection_rate:.2f}%', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        if current_max >= threshold:
+            if not detection_active:
+                detection_active = True
+                start_time = time.time()
+            elif time.time() - start_time > 10 and time.time() - last_email_time > cooldown_time:
+                if cv2.imwrite(image_path, frame):
+                    print("Image written successfully.")
+                send_line_message(image_path)
+                detection_active = False
+                last_email_time = time.time()
+        else:
+            detection_active = False
+
+        cv2.imshow('Detection Window', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
