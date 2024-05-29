@@ -2,16 +2,18 @@ import cv2
 import time
 import os
 import traceback
+import mediapipe as mp
 from google.cloud import storage
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from linebot import LineBotApi
 from linebot.models import TextSendMessage, ImageSendMessage
 from datetime import timedelta
+import subprocess
 
 # LINE setup
 LINE_ACCESS_TOKEN = os.getenv('LINE_ACCESS_TOKEN')
-LINE_USER_ID = os.getenv('LINE_USER_ID')  # The user ID to send messages to
+LINE_USER_ID = os.getenv('LINE_USER_ID')
 
 if LINE_ACCESS_TOKEN is None or LINE_USER_ID is None:
     raise ValueError("LINE_ACCESS_TOKEN or LINE_USER_ID environment variable not set")
@@ -26,32 +28,29 @@ if GOOGLE_APPLICATION_CREDENTIAL is None:
 credentials = service_account.Credentials.from_service_account_file(GOOGLE_APPLICATION_CREDENTIAL)
 
 def upload_to_bucket(bucket_name, source_file_name, destination_blob_name):
-    """Uploads a file to the bucket and returns the signed URL."""
     storage_client = storage.Client(credentials=credentials)
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(destination_blob_name)
     blob.upload_from_filename(source_file_name)
 
-    # Generate signed URL valid for 1 hour
     url = blob.generate_signed_url(expiration=timedelta(hours=1), method='GET')
     return url
 
-def send_line_message(image_path):
+def send_line_message(image_path, text="Detection has stayed over the threshold for more than 10 seconds. See the attached image."):
     try:
-        # Send the text message
-        text_message = TextSendMessage(text="Detection has stayed over the threshold for more than 10 seconds. See the attached image.")
+        # 調用外部 Python 腳本，並立即返回
+        subprocess.Popen(['python', 'D:\\CloudIoT\\CallArduino.py'])
+        text_message = TextSendMessage(text=text)
         line_bot_api.push_message(LINE_USER_ID, text_message)
         print("Text message sent successfully!")
         
-        # Upload the image to Google Cloud Storage and get the signed URL
         bucket_name = 'iot_pro'
         destination_blob_name = os.path.basename(image_path)
         image_url = upload_to_bucket(bucket_name, image_path, destination_blob_name)
         
-        # Send the image message
         image_message = ImageSendMessage(
             original_content_url=image_url,
-            preview_image_url=image_url  # Usually, you might want a smaller preview image
+            preview_image_url=image_url
         )
         line_bot_api.push_message(LINE_USER_ID, image_message)
         print("Image message sent successfully!")
@@ -65,17 +64,30 @@ face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fronta
 if face_cascade.empty():
     raise ValueError("Failed to load cascade classifiers.")
 
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands()
+
 # Initialize video capture
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     raise IOError("Cannot open webcam")
 
+# Gesture detection variables
 start_time = None
 detection_active = False
 cooldown_time = 60
 last_email_time = 0
 threshold = 3
 image_path = "last_detection.jpg"
+gesture_start_time = None
+detected_gesture = ""
+
+def is_thumbs_up(hand_landmarks):
+    thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+    thumb_ip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_IP]
+    index_mcp = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_MCP]
+    return thumb_tip.y < thumb_ip.y < index_mcp.y
 
 try:
     while True:
@@ -107,6 +119,35 @@ try:
                 last_email_time = time.time()
         else:
             detection_active = False
+
+        # Hand Gesture Recognition
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = hands.process(rgb_frame)
+
+        if result.multi_hand_landmarks:
+            for hand_landmarks in result.multi_hand_landmarks:
+                if is_thumbs_up(hand_landmarks):
+                    detected_gesture = "Thumbs Up"
+                else:
+                    detected_gesture = ""
+
+                if detected_gesture == "Thumbs Up":
+                    if gesture_start_time is None:
+                        gesture_start_time = time.time()
+                    elif time.time() - gesture_start_time > 5:
+                        cv2.putText(frame, f'{detected_gesture}!', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                        if cv2.imwrite(image_path, frame):
+                            print("Image written successfully.")
+                        send_line_message(image_path, text=f"{detected_gesture} detected!")
+                        gesture_start_time = None  # Reset gesture start time
+                else:
+                    gesture_start_time = None
+
+                for lm in hand_landmarks.landmark:
+                    h, w, c = frame.shape
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(frame, (cx, cy), 5, (0, 255, 0), cv2.FILLED)
+                mp.solutions.drawing_utils.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
         cv2.imshow('Detection Window', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
